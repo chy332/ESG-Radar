@@ -1,0 +1,969 @@
+---
+title: "Modelling - Draft due "
+author: "Black Swan - Capstone Group"
+date: "Febraury 9, 2019"
+output: html_document
+---
+
+0.1.Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir = getwd())
+
+#install.packages("fastDummies")
+#install.packages("DMwR2")
+#install.packages("performanceEstimation")
+#install.packages("randomForest")
+#install.packages("e1071")
+#install.packages("neuralnet")
+#install.packages("erer") # save list as .csv
+#install.packages("foreach")
+#install.packages("doParallel")
+library(fastDummies)
+library(data.table)
+library(DMwR2)
+library(performanceEstimation)
+library(randomForest)
+library(e1071)
+library(neuralnet)
+library(erer)
+library(dplyr)
+library(foreach)
+library(doParallel)
+library(ggplot2)
+library(ggthemes)
+library(tidyr)
+library(openxlsx)
+
+# Pallete 
+cbPalette <- c("#164D73", "#F7BD36", "#E04E70", "#164D73", "#8B8F9A")
+# Basic charts specs 
+myattributes <- theme_bw() +
+                theme(panel.border = element_blank(), 
+                      panel.grid.major = element_blank(), 
+                      panel.grid.minor = element_blank(), 
+                      axis.line = element_line(color = "grey"), 
+                      axis.ticks.x = element_blank(), 
+                      axis.ticks.y = element_blank(),
+                      plot.caption=element_text(size=9,
+                                                color = "grey"))
+
+
+```
+
+0.2 Database
+```{r database}
+# Importing database
+
+db <- read.csv("esg_scores_8Feb.csv")
+
+# Creating dummy variables for Sector, Region and Company size
+db <- dummy_cols(db, select_columns = "gics_sector")
+setnames(db, old=c("gics_sector_Communication Services", "gics_sector_Consumer Discretionary", 
+                   "gics_sector_Consumer Staples", "gics_sector_Energy", "gics_sector_Financials", 
+                   "gics_sector_Health Care", "gics_sector_Industrials", "gics_sector_Information Technology", 
+                   "gics_sector_Materials", "gics_sector_Real Estate", "gics_sector_Utilities"), 
+         new=c("Communication", "ConsumerDiscret", "ConsumerStaples", "Energy", "Financials", "HealthCare", 
+               "Industrial", "IT", "Materials", "RealEstate", "Utilities"))
+
+db <- dummy_cols(db, select_columns = "region")
+setnames(db, old=c("region_Europe", "region_North America", "region_Asia Pacific", 
+                   "region_Middle East and Africa", "region_Latin America and Caribbean"), 
+       new=c("Europe", "NorthAmerica", "AsiaPacific", "AfricaMiddleEast", "LatinAmericaCaribbean"))
+
+db <- dummy_cols(db, select_columns = "market")
+setnames(db, old=c("market_Developed Markets", "market_Emerging Markets"), 
+       new=c("DevelopedMarkets", "EmergingMarkets"))
+
+db <- dummy_cols(db, select_columns = "size")
+
+db$date <- as.Date(db$value_date, format="%m/%d/%Y")
+
+setnames(db, old=c("ï..company_id"), new=c("company_id"))
+
+db$name <- as.character(db$name)
+
+#attach(db)
+
+
+```
+
+
+1.1 Data preparation - 3 digits ESG scores
+```{r}
+
+dat_mdd <- db %>% select(mdd_1m, mdd_3m, mdd_6m, mdd_1y, mdd_18m, mdd_3y, G.1.1, G.1.2, G.1.3, G.1.4, G.1.5, G.2.1, G.2.2, G.2.3, G.2.4, G.2.5, G.2.6, G.2.7, G.2.8, G.2.9, G.2.10, G.2.11, G.2.12, G.2.13, G.3.1, G.3.2, G.3.4, S.1.1, S.1.2, S.1.3, S.1.4, S.1.5, S.1.6, S.1.7, S.2.1, S.2.2, S.2.3, S.3.3, S.4.1, S.4.3, S.5.1, S.5.2, S.5.3, E.1.1, E.1.2, E.1.3, E.1.4, E.1.5, E.1.6, E.1.7, E.1.8, E.1.9, E.1.10, E.1.11, E.1.12, E.2.1, E.2.2, E.3.2, Communication, ConsumerDiscret, ConsumerStaples, Energy, Financials, HealthCare, Industrial,IT, Materials, RealEstate, Utilities, Europe, NorthAmerica, AsiaPacific, AfricaMiddleEast, LatinAmericaCaribbean, size_Large, size_Mid, size_Small, DevelopedMarkets, EmergingMarkets)
+
+Total <- rep(1, times = nrow(dat_mdd))
+dat_mdd <- cbind(dat_mdd, Total)
+rm(Total)
+
+#Removing NAs
+dat_mdd <- dat_mdd[complete.cases(dat_mdd),]
+
+detach(db)
+
+# Training and Test data (or as Prof Povost: Validation Data)
+set.seed(1234)
+train <- sample(1:nrow(dat_mdd),as.integer(0.7*nrow(dat_mdd)))
+dat_mdd_train <- dat_mdd[train,]
+dat_mdd_test <- dat_mdd[-train,]
+rm(train)
+
+# Cross-validation using performanceEstation package. It works for lm smoothly, but takes too long time for svm and random forest. Therefore, only as a test I'm using a random sample of 10% of all data.
+#set.seed(1234)
+#sp <- sample(1:nrow(dat_mdd),as.integer(0.1*nrow(dat_mdd)))
+#dat_mdd_sp <- dat_mdd[sp,]
+#rm(sp)
+
+# equations to be used in the models: dependent variable ~ ESG scores and control variables
+f_mdd_1m <- as.formula(paste("mdd_1m ~", paste(colnames(dat_mdd_train[,7:77]), collapse = " + ")))
+f_mdd_18m <- as.formula(paste("mdd_18m ~", paste(colnames(dat_mdd_train[,7:77]), collapse = " + ")))
+f_mdd_3y <- as.formula(paste("mdd_3y ~", paste(colnames(dat_mdd_train[,7:77]), collapse = " + ")))
+
+# equations to be used in the models for subsets: dependent variable ~ ESG scores and control variables
+sector <- c("Communication", "ConsumerDiscret", "ConsumerStaples", "Energy", "Financials", "HealthCare", "Industrial","IT", "Materials", "RealEstate", "Utilities", "Total")
+region <- c("Europe", "NorthAmerica", "AsiaPacific", "AfricaMiddleEast", "LatinAmericaCaribbean")
+size <- c("size_Large", "size_Mid", "size_Small")
+esg <- colnames(dat_mdd_train[,7:58])
+
+# Creating function of each subset
+f_mdd_1m_sec <- as.formula(paste("mdd_1m ~", 
+                                 paste(esg, collapse = " + "), " + ", 
+                                 paste(region, collapse = " + "), " + ", 
+                                 paste(size, collapse = " + ")))
+f_mdd_18m_sec <- as.formula(paste("mdd_18m ~", 
+                                  paste(esg, collapse = " + "), " + ", 
+                                  paste(region, collapse = " + "), " + ", 
+                                  paste(size, collapse = " + ")))
+f_mdd_3y_sec <- as.formula(paste("mdd_3y ~", 
+                                 paste(esg, collapse = " + "), " + ", 
+                                 paste(region, collapse = " + "), " + ", 
+                                 paste(size, collapse = " + ")))
+
+f_mdd_1m_reg <- as.formula(paste("mdd_1m ~", 
+                                 paste(esg, collapse = " + "), " + ", 
+                                 paste(sector, collapse = " + "), " + ", 
+                                 paste(size, collapse = " + ")))
+f_mdd_18m_reg <- as.formula(paste("mdd_18m ~", 
+                                  paste(esg, collapse = " + "), " + ", 
+                                  paste(sector, collapse = " + "), " + ", 
+                                  paste(size, collapse = " + ")))
+
+f_mdd_3y_reg <- as.formula(paste("mdd_3y ~", 
+                                 paste(esg, collapse = " + "), " + ", 
+                                 paste(sector, collapse = " + "), " + ", 
+                                 paste(size, collapse = " + ")))
+
+f_mdd_1m_siz <- as.formula(paste("mdd_1m ~", 
+                                 paste(esg, collapse = " + "), " + ", 
+                                 paste(sector, collapse = " + "), " + ", 
+                                 paste(region, collapse = " + ")))
+f_mdd_18m_siz <- as.formula(paste("mdd_18m ~", 
+                                  paste(esg, collapse = " + "), " + ", 
+                                  paste(sector, collapse = " + "), " + ", 
+                                  paste(region, collapse = " + ")))
+f_mdd_3y_siz <- as.formula(paste("mdd_3y ~", 
+                                 paste(esg, collapse = " + "), " + ", 
+                                 paste(sector, collapse = " + "), " + ", 
+                                 paste(region, collapse = " + ")))
+
+f_mdd_sec <- c(f_mdd_1m_sec, f_mdd_18m_sec, f_mdd_3y_sec) 
+f_mdd_reg <- c(f_mdd_1m_reg, f_mdd_18m_reg, f_mdd_3y_reg)
+f_mdd_siz <- c(f_mdd_1m_siz, f_mdd_18m_siz, f_mdd_3y_siz)
+
+
+cor_matrix_mdd <-cor(dat_mdd[,1:59], method = "pearson", use = "complete.obs")
+write.csv(cor_matrix_mdd, file = "cor_matrix_mdd.csv")
+
+```
+
+2. Linear Models
+2.1 Linear Model for the subsets and total
+```{r}
+########### Running LM on training data ##############
+start_time <- Sys.time()
+
+equations <- c(f_mdd_1m, f_mdd_18m,  f_mdd_3y)
+n_equations <- c("f_mdd_1m", "f_mdd_18m",  "f_mdd_3y")
+subsets_ <- c("Communication", "ConsumerDiscret", "ConsumerStaples", "Energy", "Financials", "HealthCare", "Industrial","IT", "Materials", "RealEstate", "Utilities", "Europe", "NorthAmerica", "AsiaPacific", "AfricaMiddleEast", "LatinAmericaCaribbean", "size_Large", "size_Mid", "size_Small", "DevelopedMarkets", "EmergingMarkets", "Total")
+
+no_cores <- detectCores()-1
+cl <- makeCluster(no_cores)
+
+clusterExport(cl=cl, varlist=c("dat_mdd_train", "equations", "subsets_"))
+
+mod_mdd_lm_list <- setNames(lapply(subsets_, function(j) parLapply(cl, 1:length(equations), function(x) lm(equations[[x]], data = subset(dat_mdd_train, eval(parse(text = j))==1)))), subsets_)
+
+stopCluster(cl)
+
+end_time <- Sys.time()
+time_mod_mdd_lm <- end_time - start_time
+
+## Linear model object for subsets
+saveRDS(mod_mdd_lm_list, file = "mod_mdd_lm_list.RDA")
+
+```
+
+2.2 Outputs: R-squared, number of observations, coefficients and p-values
+```{r}
+#mod_mdd_lm_list <- readRDS(file = "mod_mdd_lm_list.RDA") ## we need this rda object to run this chunk
+########### Outputs ##############
+## Adjusted R-Squared and # of observations
+sum_mod_mdd_lm_list <- list()
+for (i in 1:length(subsets_)) {
+  res <- setNames(lapply(mod_mdd_lm_list[[i]],  summary), n_equations)
+  sum_mod_mdd_lm_list[[length(sum_mod_mdd_lm_list)+1]] <- res
+}
+
+## adj R-squared
+adjr2_mod_mdd_lm_list <- list()
+for (i in 1:length(subsets_)) {
+  res <- setNames(lapply(sum_mod_mdd_lm_list[[i]],  "[[", "adj.r.squared"), n_equations)
+  adjr2_mod_mdd_lm_list[[length(adjr2_mod_mdd_lm_list)+1]] <- res
+}
+adjr2_mod_mdd_lm_list <- setNames(adjr2_mod_mdd_lm_list, subsets_)
+write.list(adjr2_mod_mdd_lm_list, file = "adjr2_mod_mdd_lm_list.csv", row.names = TRUE)
+
+## number of observations of each model
+nobs_mod_mdd_lm_list <- list()
+for (i in 1:length(subsets_)) {
+  res <- setNames(lapply(mod_mdd_lm_list[[i]],  nobs), n_equations)
+  nobs_mod_mdd_lm_list[[length(nobs_mod_mdd_lm_list)+1]] <- res
+}
+nobs_mod_mdd_lm_list <- setNames(nobs_mod_mdd_lm_list, subsets_)
+write.list(nobs_mod_mdd_lm_list, file = "nobs_mod_mdd_lm_list.csv", row.names = TRUE)
+
+## Coefficients and p-values
+coeff_mod_mdd_lm_list <- list()
+for (i in 1:length(subsets_)) {
+  res <- setNames(lapply(sum_mod_mdd_lm_list[[i]],  coefficients), n_equations)
+  coeff_mod_mdd_lm_list[[length(coeff_mod_mdd_lm_list)+1]] <- res
+}
+coeff_mod_mdd_lm_list <- setNames(coeff_mod_mdd_lm_list, subsets_)
+write.list(coeff_mod_mdd_lm_list, file = "coeff_mod_mdd_lm_list.csv", row.names = TRUE)
+
+
+### Plot coefficients
+#install.packages("dotwhisker")
+library(dotwhisker)
+#install.packages("broom")
+library(broom)
+
+# 1m
+dw_mdd_1m <- as.data.frame(summary(mod_mdd_lm_list$Total[[1]])$coefficient)
+dw_mdd_1m <- tibble::rownames_to_column(dw_mdd_1m, "term")
+colnames(dw_mdd_1m) <- c("term" ,"estimate", "std.error", "statistic", "p.value")
+dw_mdd_1m <- dw_mdd_1m[1:53,] %>% mutate(model = "MDD 1m")
+
+dw_mdd_1m_top <- dw_mdd_1m %>% filter(dw_mdd_1m$p.value < 0.05) 
+dw_mdd_1m_top <- dw_mdd_1m_top %>% mutate(ranking = rank(desc(abs(dw_mdd_1m_top$estimate))))%>% filter(ranking < 20)
+
+dwplot(dw_mdd_1m_top) +
+  ggtitle(paste0("Linear Model Coefficients for MDD-1m")) +
+  geom_vline(xintercept = 0, colour = gray(1/2), lty = 2) +
+  myattributes + 
+  ggsave("plot_mdd_lm_dw_1m.png", width = 4, height = 6)
+
+# 18m
+dw_mdd_18m <- as.data.frame(summary(mod_mdd_lm_list$Total[[2]])$coefficient)
+dw_mdd_18m <- tibble::rownames_to_column(dw_mdd_18m, "term")
+colnames(dw_mdd_18m) <- c("term" ,"estimate", "std.error", "statistic", "p.value")
+dw_mdd_18m <- dw_mdd_18m[1:53,] %>% mutate(model = "MDD 18m")
+
+dw_mdd_18m_top <- dw_mdd_18m %>% filter(dw_mdd_18m$p.value < 0.05) 
+dw_mdd_18m_top <- dw_mdd_18m_top %>% mutate(ranking = rank(desc(abs(dw_mdd_18m_top$estimate))))%>% filter(ranking < 20)
+
+dwplot(dw_mdd_18m_top) +
+  ggtitle(paste0("Linear Model Coefficients for MDD-18m")) +
+  geom_vline(xintercept = 0, colour = gray(1/2), lty = 2) +
+  myattributes #+ 
+  #ggsave("plot_mdd_lm_dw_18m.png", width = 4, height = 6)
+
+
+# 3y
+dw_mdd_3y <- as.data.frame(summary(mod_mdd_lm_list$Total[[3]])$coefficient)
+dw_mdd_3y <- tibble::rownames_to_column(dw_mdd_3y, "term")
+colnames(dw_mdd_3y) <- c("term" ,"estimate", "std.error", "statistic", "p.value")
+dw_mdd_3y <- dw_mdd_3y[1:53,] %>% mutate(model = "MDD 3y")
+
+dw_mdd_3y_top <- dw_mdd_3y %>% filter(dw_mdd_3y$p.value < 0.05) 
+dw_mdd_3y_top <- dw_mdd_3y_top %>% mutate(ranking = rank(desc(abs(dw_mdd_3y_top$estimate))))%>% filter(ranking < 20)
+
+dwplot(dw_mdd_3y_top) +
+  ggtitle(paste0("Linear Model Coefficients for MDD-3y")) +
+  geom_vline(xintercept = 0, colour = gray(1/2), lty = 2) +
+  myattributes #+ 
+  #ggsave("plot_mdd_lm_dw_3y.png", width = 4, height = 6)
+
+
+dw_mdd <- rbind(dw_mdd_1m, dw_mdd_18m, dw_mdd_3y)
+dwplot(dw_mdd) +
+  ggtitle(paste0("Linear Model Coefficients for MDD-1m, MDD-18m and MDD-3y")) +
+  geom_vline(xintercept = 0, colour = gray(1/2), lty = 2) +
+  myattributes + 
+  ggsave("plot_mdd_lm_dw.png", width = 6, height = 8)
+
+```
+
+
+2.3 Linear model Prediction on test data and nmse
+```{r}
+## generating prediction series for all target variables and subsets
+#mod_mdd_lm_list <- readRDS(file = "mod_mdd_lm_list.RDA") ## we need this rda object to run this chunk
+pred_mdd_lm_list <- list()
+for (i in subsets_) {
+  res <- setNames(lapply(mod_mdd_lm_list[[i]], function(x) predict(x, subset(dat_mdd_test, eval(parse(text = i))==1))), n_equations)
+  pred_mdd_lm_list[[length(pred_mdd_lm_list)+1]] <- res 
+}
+pred_mdd_lm_list <- setNames(pred_mdd_lm_list, subsets_)
+
+## generating data frame subsets
+df <- list()
+for (i in subsets_) {
+  res <- dat_mdd_test %>% filter(eval(parse(text = i))==1)
+  res <- res[,1:6]
+  df[[length(df)+1]] <- res
+}
+
+## nmse by subsetor
+### 1m
+nmse_mdd_lm_1m <- list()
+for (i in 1:length(subsets_)) {
+  res <- mean(sqrt(pred_mdd_lm_list[[i]]$f_mdd_1m - df[[i]]$mdd_1m), na.rm = TRUE) / mean(sqrt(mean(df[[i]]$mdd_1m) - df[[i]]$mdd_1m), na.rm = TRUE)
+  nmse_mdd_lm_1m[[length(nmse_mdd_lm_1m)+1]] <- res   
+}
+nmse_mdd_lm_1m <- setNames(nmse_mdd_lm_1m, subsets_)
+
+### 18m
+nmse_mdd_lm_18m <- list()
+for (i in 1:length(subsets_)) {
+  res <- mean(sqrt(pred_mdd_lm_list[[i]]$f_mdd_18m - df[[i]]$mdd_18m), na.rm = TRUE) / mean(sqrt(mean(df[[i]]$mdd_18m) - df[[i]]$mdd_18m), na.rm = TRUE)
+  nmse_mdd_lm_18m[[length(nmse_mdd_lm_18m)+1]] <- res   
+}
+nmse_mdd_lm_18m <- setNames(nmse_mdd_lm_18m, subsets_)
+
+### 3y
+nmse_mdd_lm_3y <- list()
+for (i in 1:length(subsets_)) {
+  res <- mean(sqrt(pred_mdd_lm_list[[i]]$f_mdd_3y - df[[i]]$mdd_3y), na.rm = TRUE) / mean(sqrt(mean(df[[i]]$mdd_3y) - df[[i]]$mdd_3y), na.rm = TRUE)
+  nmse_mdd_lm_3y[[length(nmse_mdd_lm_3y)+1]] <- res   
+}
+nmse_mdd_lm_3y <- setNames(nmse_mdd_lm_3y, subsets_)
+
+### Output
+nmse_mdd_lm_test <- cbind(nmse_mdd_lm_1m, nmse_mdd_lm_18m, nmse_mdd_lm_3y)
+write.csv(nmse_mdd_lm_test, file="nmse_mdd_lm_test.csv")
+
+### Scatterplot of prediction vs actual by subsetor
+# 1m
+df_plot_mdd_lm_pred_1m <- as.data.frame(cbind(Prediction=pred_mdd_lm_list[["Total"]]$f_mdd_1m, Actual=dat_mdd_test$mdd_1m))
+
+plot_mdd_lm_pred_1m <- ggplot(df_plot_mdd_lm_pred_1m, aes(Prediction, Actual)) + 
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  scale_x_continuous(limits = c(0, max(max(df_plot_mdd_lm_pred_1m$Prediction), max(df_plot_mdd_lm_pred_1m$Actual)))) +
+  scale_y_continuous(limits = c(0, max(max(df_plot_mdd_lm_pred_1m$Prediction), max(df_plot_mdd_lm_pred_1m$Actual)))) +
+  coord_fixed() +
+  ggtitle(paste0("Linear Model Prediction for MDD-1m \n NMSE = ",round(nmse_mdd_lm_1m$Total, 3))) +
+  myattributes + 
+  ggsave("plot_mdd_lm_pred_1m.png", width = 4, height = 4)
+
+# 18m
+df_plot_mdd_lm_pred_18m <- as.data.frame(cbind(Prediction=pred_mdd_lm_list[["Total"]]$f_mdd_18m, Actual=dat_mdd_test$mdd_18m))
+
+plot_mdd_lm_pred_18m <- ggplot(df_plot_mdd_lm_pred_18m, aes(Prediction, Actual)) + 
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  scale_x_continuous(limits = c(0, max(max(df_plot_mdd_lm_pred_18m$Prediction), max(df_plot_mdd_lm_pred_18m$Actual)))) +
+  scale_y_continuous(limits = c(0, max(max(df_plot_mdd_lm_pred_18m$Prediction), max(df_plot_mdd_lm_pred_18m$Actual)))) +
+  coord_fixed() +
+  ggtitle(paste0("Linear Model Prediction for MDD-18m \n NMSE = ",round(nmse_mdd_lm_18m$Total, 3))) +
+  myattributes + 
+  ggsave("plot_mdd_lm_pred_18m.png", width = 4, height = 4)
+
+# 3y
+df_plot_mdd_lm_pred_3y <- as.data.frame(cbind(Prediction=pred_mdd_lm_list[["Total"]]$f_mdd_3y, Actual=dat_mdd_test$mdd_3y))
+
+plot_mdd_lm_pred_3y <- ggplot(df_plot_mdd_lm_pred_3y, aes(Prediction, Actual)) + 
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  scale_x_continuous(limits = c(0, max(max(df_plot_mdd_lm_pred_3y$Prediction), max(df_plot_mdd_lm_pred_3y$Actual)))) +
+  scale_y_continuous(limits = c(0, max(max(df_plot_mdd_lm_pred_3y$Prediction), max(df_plot_mdd_lm_pred_3y$Actual)))) +
+  coord_fixed() +
+  ggtitle(paste0("Linear Model Prediction for MDD-3y \n NMSE = ",round(nmse_mdd_lm_3y$Total, 3))) +
+  myattributes + 
+  ggsave("plot_mdd_lm_pred_3y.png", width = 4, height = 4)
+
+```
+
+
+2.4 Linear Model - Cross-Validation
+```{r}
+# Run Models by Subset
+start_time <- Sys.time()
+no_cores <- detectCores()-1
+
+# Size
+    cv_mdd_lm_siz <- list()
+      for(x in size) {
+        dat <- dat_mdd_train[dat_mdd_train[,which(colnames(dat_mdd_train) == x)]==1,]
+        
+        cl <- makeCluster(no_cores)
+        clusterExport(cl=cl, varlist=c("dat", "f_mdd_siz", "size"))
+        clusterEvalQ(cl, library("performanceEstimation"))
+        
+        res <- parLapply(cl, f_mdd_siz, function(w){
+             performanceEstimation(
+                  PredTask(w, data = dat), 
+                  workflowVariants("standardWF", learner="lm"),
+                  EstimationTask(metrics=c("mape", "nmse"), 
+                                 method=CV(nReps=1,nFolds=5)))
+        
+           })     
+        
+       stopCluster(cl)
+       cv_mdd_lm_siz[[length(cv_mdd_lm_siz)+1]] <- res
+       }
+
+## Regions
+    cv_mdd_lm_reg <- list()
+      for(x in region) {
+        dat <- dat_mdd_train[dat_mdd_train[,which(colnames(dat_mdd_train) == x)]==1,]
+        
+        cl <- makeCluster(no_cores)
+        clusterExport(cl=cl, varlist=c("dat", "f_mdd_reg", "region"))
+        clusterEvalQ(cl, library("performanceEstimation"))
+        
+        res <- parLapply(cl, f_mdd_reg, function(w){
+             performanceEstimation(
+                  PredTask(w, data = dat), 
+                  workflowVariants("standardWF", learner="lm"),
+                  EstimationTask(metrics=c("mape", "nmse"), 
+                                 method=CV(nReps=1,nFolds=5)))
+        
+           })     
+        
+       stopCluster(cl)
+       cv_mdd_lm_reg[[length(cv_mdd_lm_reg)+1]] <- res
+       }
+
+## Sectors
+    cv_mdd_lm_sec <- list()
+      for(x in sector) {
+        dat <- dat_mdd_train[dat_mdd_train[,which(colnames(dat_mdd_train) == x)]==1,]
+        
+        cl <- makeCluster(no_cores)
+        clusterExport(cl=cl, varlist=c("dat", "f_mdd_sec", "sector"))
+        clusterEvalQ(cl, library("performanceEstimation"))
+        
+        res <- parLapply(cl, f_mdd_reg, function(w){
+             performanceEstimation(
+                  PredTask(w, data = dat), 
+                  workflowVariants("standardWF", learner="lm"),
+                  EstimationTask(metrics=c("mape", "nmse"), 
+                                 method=CV(nReps=1,nFolds=5)))
+        
+           })     
+        
+       stopCluster(cl)
+       cv_mdd_lm_sec[[length(cv_mdd_lm_sec)+1]] <- res
+       }
+
+    cv_mdd_lm_sec<-setNames(cv_mdd_lm_sec, sector)
+    
+end_time <- Sys.time()
+time_cv_mdd_lm <- end_time - start_time
+
+# Output
+
+## Size
+cv_mdd_lm_siz_out <- list()
+for (i in 1:length(size)) {
+  res <- setNames(lapply(cv_mdd_lm_siz[[i]],  results2table), n_equations)
+  cv_mdd_lm_siz_out[[length(cv_mdd_lm_siz_out)+1]] <- res
+}
+cv_mdd_lm_siz_out <- setNames(cv_mdd_lm_siz_out, size)
+write.list(cv_mdd_lm_siz_out, file = "cv_mdd_lm_siz_out.csv", row.names = TRUE)
+
+## Region
+cv_mdd_lm_reg_out <- list()
+for (i in 1:length(region)) {
+  res <- setNames(lapply(cv_mdd_lm_reg[[i]],  results2table), n_equations)
+  cv_mdd_lm_reg_out[[length(cv_mdd_lm_reg_out)+1]] <- res
+}
+cv_mdd_lm_reg_out <- setNames(cv_mdd_lm_reg_out, region)
+write.list(cv_mdd_lm_reg_out, file = "cv_mdd_lm_reg_out.csv", row.names = TRUE)
+
+## Sector
+cv_mdd_lm_sec_out <- list()
+for (i in 1:length(sector)) {
+  res <- setNames(lapply(cv_mdd_lm_sec[[i]],  results2table), n_equations)
+  cv_mdd_lm_sec_out[[length(cv_mdd_lm_sec_out)+1]] <- res
+}
+cv_mdd_lm_sec_out <- setNames(cv_mdd_lm_sec_out, sector)
+write.list(cv_mdd_lm_sec_out, file = "cv_mdd_lm_sec_out.csv", row.names = TRUE)
+
+```
+
+
+3. Random Forest
+3.1 Random Forest - Subsets and Total
+```{r}
+########### Running Random Forest on Training data ############################
+equations <- c(f_mdd_1m, f_mdd_18m,  f_mdd_3y)
+n_equations <- c("f_mdd_1m", "f_mdd_18m",  "f_mdd_3y")  
+subsets_ <- c("Communication", "ConsumerDiscret", "ConsumerStaples", "Energy", "Financials", "HealthCare", "Industrial","IT", "Materials", "RealEstate", "Utilities", "Europe", "NorthAmerica", "AsiaPacific", "AfricaMiddleEast", "LatinAmericaCaribbean", "size_Large", "size_Mid", "size_Small", "DevelopedMarkets", "EmergingMarkets", "Total")
+
+start_time <- Sys.time()
+
+no_cores <- detectCores()-1
+cl <- makeCluster(no_cores)
+
+clusterExport(cl=cl, varlist=c("dat_mdd_train", "equations", "subsets_"))
+clusterEvalQ(cl, library("randomForest"))
+
+mod_mdd_rfo_list_sub <- setNames(lapply(subsets_, function(j) parLapply(cl, 1:3, function(x) randomForest(equations[[x]], data = subset(dat_mdd_train, eval(parse(text = j))==1), importance = TRUE))), subsets_)
+
+stopCluster(cl)
+
+end_time <- Sys.time()
+time_mod_mdd_rfo <- end_time - start_time # 24 hours
+
+## random forest model object for subsets
+saveRDS(mod_mdd_rfo_list_sub, file = "mod_mdd_rfo_list_sub.RDA") 
+
+```
+
+3.2 Random Forest - Outpus - Importance
+```{r}
+#################### Importance ####################
+imp_mod_mdd_rfo <- list()
+for (i in 1:length(subsets_)) {
+  res <- setNames(lapply(mod_mdd_rfo_list_sub[[i]], function(x) importance(x)), n_equations)
+  imp_mod_mdd_rfo[[length(imp_mod_mdd_rfo)+1]] <- res
+}
+
+imp_mod_mdd_rfo <- setNames(imp_mod_mdd_rfo, subsets_)
+
+write.list(imp_mod_mdd_rfo, file = "imp_mod_mdd_rfo.csv", row.names = TRUE) # tables output with score importance
+
+#################### % Var explained - equivalent to R-squared ####################
+rsq_mod_mdd_rfo_list <- list()
+for (i in 1:length(subsets_)) {
+  res <- setNames(lapply(mod_mdd_rfo_list_sub[[i]],  "[[", "rsq"), n_equations)
+  rsq_mod_mdd_rfo_list[[length(rsq_mod_mdd_rfo_list)+1]] <- res
+}
+
+rsq_mod_mdd_rfo <- list()
+for (i in 1:length(subsets_)) {
+  res <- setNames(lapply(rsq_mod_mdd_rfo_list[[i]], tail, n=1), n_equations)
+  rsq_mod_mdd_rfo[[length(rsq_mod_mdd_rfo)+1]] <- res
+}
+
+rsq_mod_mdd_rfo <- setNames(rsq_mod_mdd_rfo, subsets_)
+
+write.list(rsq_mod_mdd_rfo, file = "rsq_mod_mdd_rfo.csv") # tables output with score % Var explained
+
+#################### Plots for importance ####################
+#### %IncMSE
+# 1m
+plot_imp_mse_mdd_1m <- as.data.frame(imp_mod_mdd_rfo$Total$f_mdd_1m[1:52,1]) 
+plot_imp_mse_mdd_1m <- tibble::rownames_to_column(plot_imp_mse_mdd_1m, "Scores")
+plot_imp_mse_mdd_1m <- plot_imp_mse_mdd_1m %>% mutate(ranking = rank(desc(plot_imp_mse_mdd_1m[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_mse_mdd_1m) <- c("Scores" ,'IncMSE' )
+
+ggplot(plot_imp_mse_mdd_1m, aes(x=reorder(Scores,IncMSE), y = IncMSE)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for MDD-1m")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_mdd_rfo_imp_mse_1m.png", width = 4, height = 6)
+
+# 18m
+plot_imp_mse_mdd_18m <- as.data.frame(imp_mod_mdd_rfo$Total$f_mdd_18m[1:52,1]) 
+plot_imp_mse_mdd_18m <- tibble::rownames_to_column(plot_imp_mse_mdd_18m, "Scores")
+plot_imp_mse_mdd_18m <- plot_imp_mse_mdd_18m %>% mutate(ranking = rank(desc(plot_imp_mse_mdd_18m[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_mse_mdd_18m) <- c("Scores" ,'IncMSE' )
+
+ggplot(plot_imp_mse_mdd_18m, aes(x=reorder(Scores,IncMSE), y = IncMSE)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for MDD-18m")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_mdd_rfo_imp_mse_18m.png", width = 4, height = 6)
+
+# 3y
+plot_imp_mse_mdd_3y <- as.data.frame(imp_mod_mdd_rfo$Total$f_mdd_3y[1:52,1]) 
+plot_imp_mse_mdd_3y <- tibble::rownames_to_column(plot_imp_mse_mdd_3y, "Scores")
+plot_imp_mse_mdd_3y <- plot_imp_mse_mdd_3y %>% mutate(ranking = rank(desc(plot_imp_mse_mdd_3y[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_mse_mdd_3y) <- c("Scores" ,'IncMSE' )
+
+ggplot(plot_imp_mse_mdd_3y, aes(x=reorder(Scores,IncMSE), y = IncMSE)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for MDD-3y")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_mdd_rfo_imp_mse_3y.png", width = 4, height = 6)
+
+
+#### IncNodePurity
+# 1m
+plot_imp_npu_mdd_1m <- as.data.frame(imp_mod_mdd_rfo$Total$f_mdd_1m[1:52,2]) 
+plot_imp_npu_mdd_1m <- tibble::rownames_to_column(plot_imp_npu_mdd_1m, "Scores")
+plot_imp_npu_mdd_1m <- plot_imp_npu_mdd_1m %>% mutate(ranking = rank(desc(plot_imp_npu_mdd_1m[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_npu_mdd_1m) <- c("Scores" ,'IncNodePurity' )
+
+ggplot(plot_imp_npu_mdd_1m, aes(x=reorder(Scores,IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for MDD-1m")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_mdd_rfo_imp_npu_1m.png", width = 4, height = 6)
+
+# 18m
+plot_imp_npu_mdd_18m <- as.data.frame(imp_mod_mdd_rfo$Total$f_mdd_18m[1:52,2]) 
+plot_imp_npu_mdd_18m <- tibble::rownames_to_column(plot_imp_npu_mdd_18m, "Scores")
+plot_imp_npu_mdd_18m <- plot_imp_npu_mdd_18m %>% mutate(ranking = rank(desc(plot_imp_npu_mdd_18m[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_npu_mdd_18m) <- c("Scores" ,'IncNodePurity' )
+
+ggplot(plot_imp_npu_mdd_18m, aes(x=reorder(Scores,IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for MDD-18m")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_mdd_rfo_imp_npu_18m.png", width = 4, height = 6)
+
+# 3y
+plot_imp_npu_mdd_3y <- as.data.frame(imp_mod_mdd_rfo$Total$f_mdd_3y[1:52,2]) 
+plot_imp_npu_mdd_3y <- tibble::rownames_to_column(plot_imp_npu_mdd_3y, "Scores")
+plot_imp_npu_mdd_3y <- plot_imp_npu_mdd_3y %>% mutate(ranking = rank(desc(plot_imp_npu_mdd_3y[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_npu_mdd_3y) <- c("Scores" ,'IncNodePurity' )
+
+ggplot(plot_imp_npu_mdd_3y, aes(x=reorder(Scores,IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for MDD-3y")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_mdd_rfo_imp_npu_3y.png", width = 4, height = 6)
+
+varImpPlot(mod_mdd_rfo_list_sub$Total[[3]])
+
+
+```
+
+3.3 Random Forest Model Prediction on test data and nmse
+```{r}
+########## Prediction on test data and nmse ###############
+#mod_mdd_rfo_list_sub <- readRDS("mod_mdd_rfo_list_sub.RDA") # open this file for the codes below
+## generating prediction series for all target variables and subsets
+pred_mdd_rfo_list <- list()
+for (i in subsets_) {
+  res <- setNames(lapply(mod_mdd_rfo_list_sub[[i]], function(x) predict(x, subset(dat_mdd_test, eval(parse(text = i))==1))), n_equations)
+  pred_mdd_rfo_list[[length(pred_mdd_rfo_list)+1]] <- res 
+}
+pred_mdd_rfo_list <- setNames(pred_mdd_rfo_list, subsets_)
+
+## generating data frame subsets
+df <- list()
+for (i in subsets_) {
+  res <- dat_mdd_test %>% filter(eval(parse(text = i))==1)
+  res <- res[,1:6]
+  df[[length(df)+1]] <- res
+}
+
+## nmse by subsetor
+### 1m
+nmse_mdd_rfo_1m <- list()
+for (i in 1:length(subsets_)) {
+  res <- mean(sqrt(pred_mdd_rfo_list[[i]]$f_mdd_1m - df[[i]]$mdd_1m), na.rm = TRUE) / mean(sqrt(mean(df[[i]]$mdd_1m) - df[[i]]$mdd_1m), na.rm = TRUE)
+  nmse_mdd_rfo_1m[[length(nmse_mdd_rfo_1m)+1]] <- res   
+}
+nmse_mdd_rfo_1m <- setNames(nmse_mdd_rfo_1m, subsets_)
+
+### 18m
+nmse_mdd_rfo_18m <- list()
+for (i in 1:length(subsets_)) {
+  res <- mean(sqrt(pred_mdd_rfo_list[[i]]$f_mdd_18m - df[[i]]$mdd_18m), na.rm = TRUE) / mean(sqrt(mean(df[[i]]$mdd_18m) - df[[i]]$mdd_18m), na.rm = TRUE)
+  nmse_mdd_rfo_18m[[length(nmse_mdd_rfo_18m)+1]] <- res   
+}
+nmse_mdd_rfo_18m <- setNames(nmse_mdd_rfo_18m, subsets_)
+
+### 3y
+nmse_mdd_rfo_3y <- list()
+for (i in 1:length(subsets_)) {
+  res <- mean(sqrt(pred_mdd_rfo_list[[i]]$f_mdd_3y - df[[i]]$mdd_3y), na.rm = TRUE) / mean(sqrt(mean(df[[i]]$mdd_3y) - df[[i]]$mdd_3y), na.rm = TRUE)
+  nmse_mdd_rfo_3y[[length(nmse_mdd_rfo_3y)+1]] <- res   
+}
+nmse_mdd_rfo_3y <- setNames(nmse_mdd_rfo_3y, subsets_)
+
+### Output
+nmse_mdd_rfo_test <- cbind(nmse_mdd_rfo_1m, nmse_mdd_rfo_18m, nmse_mdd_rfo_3y)
+write.csv(nmse_mdd_rfo_test, file="nmse_mdd_rfo_test.csv")
+
+####### Chart Prediction vs Actual on Test data #############
+library(ggplot2)
+install.packages("ggthemes")
+library(ggthemes)
+
+# Pallete 
+cbPalette <- c("#164D73", "#F7BD36", "#E04E70", "#164D73", "#8B8F9A")
+# Basic charts specs 
+myattributes <- theme_bw() +
+                theme(panel.border = element_blank(), 
+                      panel.grid.major = element_blank(), 
+                      panel.grid.minor = element_blank(), 
+                      axis.line = element_line(color = "grey"), 
+                      axis.ticks.x = element_blank(), 
+                      axis.ticks.y = element_blank(),
+                      plot.caption=element_text(size=9,
+                                                color = "grey"))
+
+# 1m
+df_plot_mdd_rfo_pred_1m <- as.data.frame(cbind(Prediction=pred_mdd_rfo_list[["Total"]]$f_mdd_1m, Actual=dat_mdd_test$mdd_1m))
+
+plot_mdd_rfo_pred_1m <- ggplot(df_plot_mdd_rfo_pred_1m, aes(Prediction, Actual)) + 
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  scale_x_continuous(limits = c(0, max(max(df_plot_mdd_rfo_pred_1m$Prediction), max(df_plot_mdd_rfo_pred_1m$Actual)))) +
+  scale_y_continuous(limits = c(0, max(max(df_plot_mdd_rfo_pred_1m$Prediction), max(df_plot_mdd_rfo_pred_1m$Actual)))) +
+  coord_fixed() +
+  ggtitle(paste0("Random Forest Prediction for MDD-1m \n NMSE = ",round(nmse_mdd_rfo_1m$Total, 3))) +
+  myattributes + 
+  ggsave("plot_mdd_rfo_pred_1m.png", width = 4, height = 4)
+
+# 18m
+df_plot_mdd_rfo_pred_18m <- as.data.frame(cbind(Prediction=pred_mdd_rfo_list[["Total"]]$f_mdd_18m, Actual=dat_mdd_test$mdd_18m))
+
+plot_mdd_rfo_pred_18m <- ggplot(df_plot_mdd_rfo_pred_18m, aes(Prediction, Actual)) + 
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  scale_x_continuous(limits = c(0, max(max(df_plot_mdd_rfo_pred_18m$Prediction), max(df_plot_mdd_rfo_pred_18m$Actual)))) +
+  scale_y_continuous(limits = c(0, max(max(df_plot_mdd_rfo_pred_18m$Prediction), max(df_plot_mdd_rfo_pred_18m$Actual)))) +
+  coord_fixed() +
+  ggtitle(paste0("Random Forest Prediction for MDD-18m \n NMSE = ",round(nmse_mdd_rfo_18m$Total, 3))) +
+  myattributes + 
+  ggsave("plot_mdd_rfo_pred_18m.png", width = 4, height = 4)
+
+# 3y
+df_plot_mdd_rfo_pred_3y <- as.data.frame(cbind(Prediction=pred_mdd_rfo_list[["Total"]]$f_mdd_3y, Actual=dat_mdd_test$mdd_3y))
+
+plot_mdd_rfo_pred_3y <- ggplot(df_plot_mdd_rfo_pred_3y, aes(Prediction, Actual)) + 
+  geom_point() +
+  geom_smooth(method=lm, se=FALSE) +
+  scale_x_continuous(limits = c(0, max(max(df_plot_mdd_rfo_pred_3y$Prediction), max(df_plot_mdd_rfo_pred_3y$Actual)))) +
+  scale_y_continuous(limits = c(0, max(max(df_plot_mdd_rfo_pred_3y$Prediction), max(df_plot_mdd_rfo_pred_3y$Actual)))) +
+  coord_fixed() +
+  ggtitle(paste0("Random Forest Prediction for MDD-3y \n NMSE = ",round(nmse_mdd_rfo_3y$Total, 3))) +
+  myattributes + 
+  ggsave("plot_mdd_rfo_pred_3y.png", width = 4, height = 4)
+
+```
+
+3.4 Random Forest - Performance Estimation - TOTAL WITHOUT SUBSETS
+```{r}
+start_time <- Sys.time()
+
+equations <- c(f_mdd_1m, f_mdd_18m,  f_mdd_3y)
+
+# preparing the clusters to run in parallel
+no_cores <- detectCores()-1
+cl <- makeCluster(no_cores)
+clusterExport(cl=cl, varlist=c("dat_mdd_train", "equations"))
+clusterEvalQ(cl, library("performanceEstimation"))
+clusterEvalQ(cl, library("randomForest"))
+
+mod_mdd_rfo_list <- parLapply(cl, 1:3, function(x) performanceEstimation(PredTask(equations[[x]], data = dat_mdd_train), workflowVariants("standardWF", learner="randomForest"), EstimationTask(metrics=c("mape", "nmse"), method=CV(nReps=1,nFolds=5))))
+
+stopCluster(cl)
+
+end_time <- Sys.time()
+time_mdd_rfo_parallel <- end_time - start_time
+
+# Output
+mod_mdd_rfo_boxplot <- cbind(mdd_1m = as.vector(getScores(res[[1]],"randomForest","dat_mdd_train.mdd_1m")),
+                            mdd_18m = as.vector(getScores(res[[2]],"randomForest","dat_mdd_train.mdd_18m")),
+                            mdd_3y = as.vector(getScores(res[[3]],"randomForest","dat_mdd_train.mdd_3y")))
+
+bplot_mdd_rfo_mape <- boxplot.matrix(mod_mdd_rfo_boxplot[1:5,], main = "Random Forest - MAPE")
+bplot_mdd_rfo_nmse <- boxplot.matrix(mod_mdd_rfo_boxplot[5:10,], main = "Random Forest - Normalized MSE")
+
+```
+
+3.5 Random Forest - Cross-Validation - SUBSETS
+```{r}
+# Run Models by Subset
+start_time <- Sys.time()
+no_cores <- detectCores()-1
+
+# Size
+    cv_mdd_rfo_siz <- list()
+      for(x in size) {
+        dat <- dat_mdd_train[dat_mdd_train[,which(colnames(dat_mdd_train) == x)]==1,]
+        
+        cl <- makeCluster(no_cores)
+        clusterExport(cl=cl, varlist=c("dat", "f_mdd_siz", "size"))
+        clusterEvalQ(cl, library("performanceEstimation"))
+        clusterEvalQ(cl, library("randomForest"))
+        res <- parLapply(cl, f_mdd_siz, function(w){
+             performanceEstimation(
+                  PredTask(w, data = dat), 
+                  workflowVariants("standardWF", learner="randomForest"),
+                  EstimationTask(metrics=c("mape", "nmse"), 
+                                 method=CV(nReps=1,nFolds=5)))
+        
+           })     
+        
+       stopCluster(cl)
+       cv_mdd_rfo_siz[[length(cv_mdd_rfo_siz)+1]] <- res
+       }
+
+## Regions
+    cv_mdd_rfo_reg <- list()
+      for(x in region) {
+        dat <- dat_mdd_train[dat_mdd_train[,which(colnames(dat_mdd_train) == x)]==1,]
+        
+        cl <- makeCluster(no_cores)
+        clusterExport(cl=cl, varlist=c("dat", "f_mdd_reg", "region"))
+        clusterEvalQ(cl, library("performanceEstimation"))
+        clusterEvalQ(cl, library("randomForest"))
+        res <- parLapply(cl, f_mdd_reg, function(w){
+             performanceEstimation(
+                  PredTask(w, data = dat), 
+                  workflowVariants("standardWF", learner="randomForest"),
+                  EstimationTask(metrics=c("mape", "nmse"), 
+                                 method=CV(nReps=1,nFolds=5)))
+        
+           })     
+        
+       stopCluster(cl)
+       cv_mdd_rfo_reg[[length(cv_mdd_rfo_reg)+1]] <- res
+       }
+
+## Sectors
+    cv_mdd_rfo_sec <- list()
+      for(x in sector) {
+        dat <- dat_mdd_train[dat_mdd_train[,which(colnames(dat_mdd_train) == x)]==1,]
+        
+        cl <- makeCluster(no_cores)
+        clusterExport(cl=cl, varlist=c("dat", "f_mdd_sec", "sector"))
+        clusterEvalQ(cl, library("performanceEstimation"))
+        clusterEvalQ(cl, library("randomForest"))
+        res <- parLapply(cl, f_mdd_reg, function(w){
+             performanceEstimation(
+                  PredTask(w, data = dat), 
+                  workflowVariants("standardWF", learner="randomForest"),
+                  EstimationTask(metrics=c("mape", "nmse"), 
+                                 method=CV(nReps=1,nFolds=5)))
+        
+           })     
+        
+       stopCluster(cl)
+       cv_mdd_rfo_sec[[length(cv_mdd_rfo_sec)+1]] <- res
+       }
+
+    cv_mdd_rfo_sec<-setNames(cv_mdd_rfo_sec, sector)
+    
+end_time <- Sys.time()
+time_cv_mdd_rfo <- end_time-start_time
+
+# Output
+
+## Size
+cv_mdd_rfo_siz_out <- list()
+for (i in 1:length(size)) {
+  res <- setNames(lapply(cv_mdd_rfo_siz[[i]],  results2table), n_equations)
+  cv_mdd_rfo_siz_out[[length(cv_mdd_rfo_siz_out)+1]] <- res
+}
+cv_mdd_rfo_siz_out <- setNames(cv_mdd_rfo_siz_out, size)
+write.list(cv_mdd_rfo_siz_out, file = "cv_mdd_rfo_siz_out.csv", row.names = TRUE)
+
+## Region
+cv_mdd_rfo_reg_out <- list()
+for (i in 1:length(region)) {
+  res <- setNames(lapply(cv_mdd_rfo_reg[[i]],  results2table), n_equations)
+  cv_mdd_rfo_reg_out[[length(cv_mdd_rfo_reg_out)+1]] <- res
+}
+cv_mdd_rfo_reg_out <- setNames(cv_mdd_rfo_reg_out, region)
+write.list(cv_mdd_rfo_reg_out, file = "cv_mdd_rfo_reg_out.csv", row.names = TRUE)
+
+## Sector
+cv_mdd_rfo_sec_out <- list()
+for (i in 1:length(sector)) {
+  res <- setNames(lapply(cv_mdd_rfo_sec[[i]],  results2table), n_equations)
+  cv_mdd_rfo_sec_out[[length(cv_mdd_rfo_sec_out)+1]] <- res
+}
+cv_mdd_rfo_sec_out <- setNames(cv_mdd_rfo_sec_out, sector)
+write.list(cv_mdd_rfo_sec_out, file = "cv_mdd_rfo_sec_out.csv", row.names = TRUE)
+
+```
+
+
+3.6 Prediction using Random Forest for Aug 2018
+```{r}
+# prepare data to predict
+dat_mdd <- db %>% select(G.1.1, G.1.2, G.1.3, G.1.4, G.1.5, G.2.1, G.2.2, G.2.3, G.2.4, G.2.5, G.2.6, G.2.7, G.2.8, G.2.9, G.2.10, G.2.11, G.2.12, G.2.13, G.3.1, G.3.2, G.3.4, S.1.1, S.1.2, S.1.3, S.1.4, S.1.5, S.1.6, S.1.7, S.2.1, S.2.2, S.2.3, S.3.3, S.4.1, S.4.3, S.5.1, S.5.2, S.5.3, E.1.1, E.1.2, E.1.3, E.1.4, E.1.5, E.1.6, E.1.7, E.1.8, E.1.9, E.1.10, E.1.11, E.1.12, E.2.1, E.2.2, E.3.2, Communication, ConsumerDiscret, ConsumerStaples, Energy, Financials, HealthCare, Industrial,IT, Materials, RealEstate, Utilities, Europe, NorthAmerica, AsiaPacific, AfricaMiddleEast, LatinAmericaCaribbean, size_Large, size_Mid, size_Small, DevelopedMarkets, EmergingMarkets, company_id, name, date)
+
+# PROBLEM: there are 13 scores without any value from 2018-01-01 and on. Therefore, we cannot predict
+dat_mdd %>% subset(date>"2017-12-31") %>% 
+  select(everything()) %>% summarise_all(funs(sum(is.na(.))))
+
+dat_mdd %>% subset(date>"2018-07-31") %>%  # same thing for Aug 2018 (13 scores with NA)
+  select(everything()) %>% summarise_all(funs(sum(is.na(.))))
+
+
+########### let's use the latest non-NA value for each company to fill the NA
+dat_fill <- dat_mdd %>% group_by(name) %>% fill(G.1.1:E.3.2) #
+sum(complete.cases(dat_mdd)) # 132,915 complete cases
+sum(complete.cases(dat_fill)) # 196,929 complete cases - 64,014 new cases without NA
+
+# now there are 1,899 companies with data in Aug 2018
+mean_allPeriod <- dat_fill %>% 
+  group_by(name) %>% 
+  summarise_at(vars(G.1.1:size_Small), mean, na.rm=TRUE)
+sum(complete.cases(mean_allPeriod))
+#openxlsx::write.xlsx(mean_allPeriod, file = "mean_allPeriod.xlsx")
+
+Aug2018 <- dat_fill %>% 
+  select(everything()) %>% 
+  subset(date>"2018-07-31") %>% 
+  group_by(name) %>% 
+  summarise_at(vars(G.1.1:size_Small), mean, na.rm=TRUE)
+sum(complete.cases(Aug2018))
+#openxlsx::write.xlsx(Aug2018, file = "Aug2018.xlsx")
+
+Aug2018_complete <- Aug2018[complete.cases(Aug2018),]
+
+
+
+########### call the model list
+mod_mdd_rfo_list_sub <- readRDS("mod_mdd_rfo_list_sub.RDA")
+
+# predict
+p_mdd18m <- predict(mod_mdd_rfo_list_sub$Total[[2]], newdata = Aug2018_complete)
+p_mdd3y <- predict(mod_mdd_rfo_list_sub$Total[[3]], newdata = Aug2018_complete)
+p_mdd <- data.frame(cbind(Aug2018_complete, p_mdd18m, p_mdd3y))
+openxlsx::write.xlsx(p_mdd, file = "p_mdd.xlsx")
+
+# statistics predict and historical data
+hist(p_mdd$p_mdd3y)
+hist(db$mdd_3y)
+summary(p_mdd$p_mdd3y)
+summary(db$mdd_3y)
+
+hist(p_mdd$p_mdd18m)
+hist(db$mdd_18m)
+summary(p_mdd$p_mdd18m)
+summary(db$mdd_18m)
+
+```
+
+
+
