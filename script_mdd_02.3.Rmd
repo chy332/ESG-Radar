@@ -1,5 +1,5 @@
 ---
-title: "Modelling - Draft due "
+title: "ESG Radar - MDD Model"
 author: "Black Swan - Capstone Group"
 date: "Febraury 9, 2019"
 output: html_document
@@ -80,7 +80,7 @@ db <- dummy_cols(db, select_columns = "size")
 
 db$date <- as.Date(db$value_date, format="%m/%d/%Y")
 
-setnames(db, old=c("ï..company_id"), new=c("company_id"))
+setnames(db, old=c("Ã¯..company_id"), new=c("company_id"))
 
 db$name <- as.character(db$name)
 
