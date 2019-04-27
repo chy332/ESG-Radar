@@ -1,0 +1,518 @@
+---
+title: "ESG Radar - Black Swan Model"
+author: "Black Swan - Capstone Group"
+date: "Febraury 9, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir = getwd())
+
+#install.packages("fastDummies")
+#install.packages("DMwR2")
+#install.packages("performanceEstimation")
+#install.packages("randomForest")
+#install.packages("e1071")
+#install.packages("neuralnet")
+#install.packages("erer") # save list as .csv
+#install.packages("foreach")
+#install.packages("doParallel")
+#install.packages("mfx")
+#install.packages("rlang")
+#install.packages("caret")
+#install.packages("ROCR")
+#install.packages("lubridate")
+library(fastDummies)
+library(data.table)
+library(DMwR2)
+library(performanceEstimation)
+library(randomForest)
+library(e1071)
+#library(neuralnet)
+library(erer)
+library(dplyr)
+library(foreach)
+library(doParallel)
+library(mfx)
+library(caret)
+library(ROCR)
+library(lubridate)
+
+
+
+```
+
+0. Database
+```{r database}
+# Importing database
+
+db <- read.csv("esg_scores_8Feb.csv")
+
+# Creating dummy variables for Sector, Region and Company size
+db <- dummy_cols(db, select_columns = "gics_sector")
+setnames(db, old=c("gics_sector_Communication Services", "gics_sector_Consumer Discretionary", 
+                   "gics_sector_Consumer Staples", "gics_sector_Energy", "gics_sector_Financials", 
+                   "gics_sector_Health Care", "gics_sector_Industrials", "gics_sector_Information Technology", 
+                   "gics_sector_Materials", "gics_sector_Real Estate", "gics_sector_Utilities"), 
+         new=c("Communication", "ConsumerDiscret", "ConsumerStaples", "Energy", "Financials", "HealthCare", 
+               "Industrial", "IT", "Materials", "RealEstate", "Utilities"))
+
+db <- dummy_cols(db, select_columns = "region")
+setnames(db, old=c("region_Europe", "region_North America", "region_Asia Pacific", 
+                   "region_Middle East and Africa", "region_Latin America and Caribbean"), 
+       new=c("Europe", "NorthAmerica", "AsiaPacific", "AfricaMiddleEast", "LatinAmericaCaribbean"))
+
+db <- dummy_cols(db, select_columns = "market")
+setnames(db, old=c("market_Developed Markets", "market_Emerging Markets"), 
+       new=c("DevelopedMarkets", "EmergingMarkets"))
+
+db <- dummy_cols(db, select_columns = "size")
+
+# Transform value_date as date
+db$value_date <- mdy(db$value_date)
+
+attach(db)
+
+```
+
+1.1 Data preparation - 3 digits ESG scores
+```{r}
+
+dat_bs <- as.data.frame(cbind(bs_1w, bs_1m, bs_3m, bs_6m, bs_1y, bs_18m, bs_3y, G.1.1, G.1.2, G.1.3, G.1.4, G.1.5, G.2.1, G.2.2, G.2.3, G.2.4, G.2.5, G.2.6, G.2.7, G.2.8, G.2.9, G.2.10, G.2.11, G.2.12, G.2.13, G.3.1, G.3.2, G.3.4, S.1.1, S.1.2, S.1.3, S.1.4, S.1.5, S.1.6, S.1.7, S.2.1, S.2.2, S.2.3, S.3.3, S.4.1, S.4.3, S.5.1, S.5.2, S.5.3, E.1.1, E.1.2, E.1.3, E.1.4, E.1.5, E.1.6, E.1.7, E.1.8, E.1.9, E.1.10, E.1.11, E.1.12, E.2.1, E.2.2, E.3.2, Communication, ConsumerDiscret, ConsumerStaples, Energy, Financials, HealthCare, Industrial,IT, Materials, RealEstate, Utilities, Europe, NorthAmerica, AsiaPacific, AfricaMiddleEast, LatinAmericaCaribbean, size_Large, size_Mid, size_Small, DevelopedMarkets, EmergingMarkets, value_date, "name"=db[,1]))
+
+Total <- rep(1, times = nrow(dat_bs))
+dat_bs <- cbind(dat_bs, Total)
+
+dat_bs$date<-as.Date(dat_bs$value_date)
+
+#Removing NAs
+#dat_bs <- dat_bs[complete.cases(dat_bs),]
+
+detach(db)
+#rm(db)
+
+# Training and Test data (or as Prof Povost: Validation Data)
+set.seed(1234)
+train <- sample(1:nrow(dat_bs),as.integer(0.7*nrow(dat_bs)))
+dat_bs_train <- dat_bs[train,]
+dat_bs_test <- dat_bs[-train,]
+rm(train)
+
+# Cross-validation using performanceEstation package. It works for lm smoothly, but takes too long time for svm and random forest. Therefore, only as a test I'm using a random sample of 10% of all data.
+set.seed(1234)
+sp <- sample(1:nrow(dat_bs_train),as.integer(0.1*nrow(dat_bs_train)))
+dat_bs_sp <- dat_bs_train[sp,]
+
+# equations to be used in the models: dependent variable ~ ESG scores and control variables
+f_bs_1m <- as.formula(paste("bs_1m ~", paste(colnames(dat_bs[,8:78]), collapse = " + ")))
+f_bs_3m <- as.formula(paste("bs_3m ~", paste(colnames(dat_bs[,8:78]), collapse = " + ")))
+f_bs_6m <- as.formula(paste("bs_6m ~", paste(colnames(dat_bs[,8:78]), collapse = " + ")))
+f_bs_1y <- as.formula(paste("bs_1y ~", paste(colnames(dat_bs[,8:78]), collapse = " + ")))
+
+
+```
+
+
+1.2 Some statistics
+```{r}
+
+# Distribution of Black Swan on Total data base
+dist_bs <- as.data.frame(apply(dat_bs[,1:7], 2, table))
+number_bs <- as.data.frame(dist_bs[2,]/dist_bs[1,])
+dist_bs_tbl <- rbind(dist_bs, number_bs) 
+
+dist_bs_until2015 <- as.data.frame(apply(subset(dat_bs[,1:7], dat_bs$date<"2015-09-30"), 2, table))
+number_bs <- dist_bs_until2015[2,]/dist_bs_until2015[1,]
+dist_bs_until2015_tbl <- rbind(dist_bs_until2015, number_bs) 
+
+write.csv(dist_bs_tbl, file="dist_bs_tbl.csv")
+dist_bs_until2015_tbl
+
+
+apply(dat_bs_train, 2, function(x) sum(is.na(x)))
+
+```
+
+
+2. Logit
+2.1 Coefficients
+```{r}
+
+equation <- c(f_bs_1m, f_bs_3m, f_bs_6m, f_bs_1y)
+n_equation <- c("f_bs_1m", "f_bs_3m", "f_bs_6m", "f_bs_1y")
+
+mod_bs_log_list <- lapply(equation, function(x) glm(x, data = dat_bs_train, family = binomial(link = "logit")))
+
+
+# Output
+## Coefficients in log-odds and odds
+coeff_mod_bs_log <- setNames(lapply(mod_bs_log_list, function(x){
+
+  cbind(LogOdd=round(coef(summary(x))[,1],4),
+      Odds=round(exp(coef(summary(x))[,1]),4),
+      pvalue=round(coef(summary(x))[,4],4))
+ 
+}), n_equation)
+write.list(coeff_mod_bs_log, file="coeff_mod_bs_log.csv", row.names = TRUE)
+
+
+## Number of observations of each model
+nobs_mod_bs_log <- setNames(lapply(mod_bs_log_list,  nobs), n_equation)
+write.list(nobs_mod_bs_log, file = "nobs_mod_bs_log.csv", row.names = TRUE)
+
+## LogLikelihhod of each model
+logLik_mod_bs_log <- setNames(lapply(mod_bs_log_list,  logLik), n_equation)
+write.list(logLik_mod_bs_log, file = "logLik_mod_bs_log.csv", row.names = TRUE)
+
+## Akaike of each model
+aic_mod_bs_log <- setNames(lapply(mod_bs_log_list,  extractAIC), n_equation)
+write.list(aic_mod_bs_log, file = "aic_mod_bs_log.csv", row.names = TRUE)
+
+
+```
+
+
+2.2 Logit Model - Performance Estimation - Confusion Matrix, Accuracy, ROC and AUC
+```{r}
+mod_bs_log_list<-readRDS("mod_bs_bs_log_list.RDA")
+####### Confusion Matrix and Accuracy ###########
+## Predict values
+pred_mod_bs_log <- lapply(mod_bs_log_list, function(x){
+  exp(predict.glm(x,newdata=subset(dat_bs_test,type='response')))/
+  (1+exp(predict.glm(x,newdata=subset(dat_bs_test,type='response'))))
+}) 
+
+## Threshold for Black Swan
+thresh <- 0.05
+resp_mod_bs_log <- setNames(lapply(pred_mod_bs_log, function(x) ifelse(x > thresh,1,0)),n_equation)
+
+## Accuracy
+misClassError_bs_1m <- mean(resp_mod_bs_log$f_bs_1m != dat_bs_test$bs_1m, na.rm = TRUE)
+misClassError_bs_3m <- mean(resp_mod_bs_log$f_bs_3m != dat_bs_test$bs_3m, na.rm = TRUE)
+misClassError_bs_6m <- mean(resp_mod_bs_log$f_bs_6m != dat_bs_test$bs_6m, na.rm = TRUE)
+misClassError_bs_1y <- mean(resp_mod_bs_log$f_bs_1y != dat_bs_test$bs_1y, na.rm = TRUE)
+accuracy <- cbind(bs_1m=(1-misClassError_bs_1m), bs_3m=(1-misClassError_bs_3m), bs_6m=(1-misClassError_bs_6m), bs_1y=(1-misClassError_bs_1y)) 
+
+accuracy
+
+## Confusion Matrix
+xtable_bs_1m <- table(resp_mod_bs_log$f_bs_1m, dat_bs_test$bs_1m)
+xtable_bs_3m <- table(resp_mod_bs_log$f_bs_3m, dat_bs_test$bs_3m)
+xtable_bs_6m <- table(resp_mod_bs_log$f_bs_6m, dat_bs_test$bs_6m)
+xtable_bs_1y <- table(resp_mod_bs_log$f_bs_1y, dat_bs_test$bs_1y)
+xtable <- as.list(c(xtable_bs_1m, xtable_bs_3m, xtable_bs_6m, xtable_bs_1y))
+
+confusionMatrix(xtable_bs_1m)
+
+####### Data for ROC ###########
+dat_bs_test <- dat_bs_test[,1:80] 
+p_log_1m <- predict.glm(mod_bs_log_list[[1]], dat_bs_test, type="response")
+pr_log_1m <- prediction(as.numeric(p_log_1m), as.numeric(dat_bs_test$bs_1m))
+prf_log_1m <- performance(pr_log_1m, measure = "tpr", x.measure = "fpr")
+
+p_log_3m <- predict(mod_bs_log_list[[2]], newdata=dat_bs_test, type="response")
+pr_log_3m <- prediction(as.numeric(p_log_3m), as.numeric(dat_bs_test$bs_3m))
+prf_log_3m <- performance(pr_log_3m, measure = "tpr", x.measure = "fpr")
+
+p_log_6m <- predict(mod_bs_log_list[[2]], newdata=dat_bs_test, type="response")
+pr_log_6m <- prediction(as.numeric(p_log_6m), as.numeric(dat_bs_test$bs_6m))
+prf_log_6m <- performance(pr_log_6m, measure = "tpr", x.measure = "fpr")
+
+p_log_1y <- predict(mod_bs_log_list[[3]], newdata=dat_bs_test, type="response")
+pr_log_1y <- prediction(as.numeric(p_log_1y), as.numeric(dat_bs_test$bs_1y))
+prf_log_1y <- performance(pr_log_1y, measure = "tpr", x.measure = "fpr")
+
+####### AUC ###########
+auc_bs_log_1m <- performance(pr_log_1m, measure = "auc")
+auc_bs_log_1m <- auc_bs_log_1m@y.values[[1]]
+
+auc_bs_log_3m <- performance(pr_log_3m, measure = "auc")
+auc_bs_log_3m <- auc_bs_log_3m@y.values[[1]]
+
+auc_bs_log_6m <- performance(pr_log_6m, measure = "auc")
+auc_bs_log_6m <- auc_bs_log_6m@y.values[[1]]
+
+auc_bs_log_1y <- performance(pr_log_1y, measure = "auc")
+auc_bs_log_1y <- auc_bs_log_1y@y.values[[1]]
+
+### Outputs
+# 1m 
+png('plot_roc_bs_log_1m.png')
+plot(prf_log_1m, main = paste0("BS 1m: ROC Curve for Logistic Regression -  ","AUC = ", round(auc_bs_log_1m*100,1),"%"), col=2, lwd=2)
+abline(a=0, b=1, col="gray")
+
+# 3m
+png('plot_roc_bs_log_3m.png')
+plot(prf_log_3m, main = paste0("BS 3m: ROC Curve for Logistic Regression -  ","AUC = ", round(auc_bs_log_3m*100,1),"%"), col=2, lwd=2)
+abline(a=0, b=1, col="gray")
+
+# 6m
+png('plot_roc_bs_log_6m.png')
+plot(prf_log_6m, main = paste0("BS 6m: ROC Curve for Logistic Regression -  ","AUC = ", round(auc_bs_log_6m*100,1),"%"), col=2, lwd=2)
+abline(a=0, b=1, col="gray")
+
+# 1y
+png('plot_roc_bs_log_1y.png')
+plot(prf_log_1y, main = paste0("BS 1y: ROC Curve for Logistic Regression -  ","AUC = ", round(auc_bs_log_1y*100,1),"%"), col=2, lwd=2)
+abline(a=0, b=1, col="gray")
+
+```
+
+3 Random Forest
+3.1 Data Preparation
+```{r}
+
+# Transform target variable into factor
+db[,200:206] <- as.data.frame(apply(db[,200:206], 2, function(x) as.factor(x)))
+
+# Transform target variable into factor
+dat_bs_rfo_train <- dat_bs_train
+dat_bs_rfo_train$bs_1m <- as.factor(dat_bs_rfo_train$bs_1m)
+dat_bs_rfo_train$bs_18m <- as.factor(dat_bs_rfo_train$bs_18m)
+dat_bs_rfo_train$bs_3y <- as.factor(dat_bs_rfo_train$bs_3y)
+
+dat_bs_rfo_test <- dat_bs_test
+dat_bs_rfo_test$bs_1m <- as.factor(dat_bs_rfo_test$bs_1m)
+dat_bs_rfo_test$bs_18m <- as.factor(dat_bs_rfo_test$bs_18m)
+dat_bs_rfo_test$bs_3y <- as.factor(dat_bs_rfo_test$bs_3y)
+
+```
+
+3.2 Run RandomForest
+```{r}
+# Target variables
+equation <- c(f_bs_1m, f_bs_3m, f_bs_6m, f_bs_1y)
+n_equation <- c("f_bs_1m", "f_bs_3m", "f_bs_6m", "f_bs_1y")
+
+# Run RandomForest on training
+start_time <- Sys.time()
+
+mod_bs_rfo_list <- lapply(equation, function(x) randomForest(x, data = dat_bs_rfo_train, importance=TRUE))
+
+end_time <- Sys.time()
+time_mod_bs_rfo <- end_time-start_time
+
+saveRDS(mod_bs_rfo_list, file = "mod_bs_rfo_list.RDA")
+mod_bs_rfo_list<-readRDS("mod_bs_rfo_list.RDA")
+```
+
+3.3 Performance Estimation - Confusion Matrix
+```{r}
+
+pred <- lapply(mod_bs_rfo_list, function(x) predict(x, dat_bs_rfo_test, type = "class"))
+
+# Accuracy
+acc_bs_rfo_1m <- round(mean(pred[[1]] == dat_bs_rfo_test$bs_1m),4)
+acc_bs_rfo_3m <- round(mean(pred[[2]] == dat_bs_rfo_test$bs_3m),4)
+acc_bs_rfo_6m <- round(mean(pred[[3]] == dat_bs_rfo_test$bs_6m),4)
+acc_bs_rfo_1y <- round(mean(pred[[4]] == dat_bs_rfo_test$bs_1y),4)
+
+# Confusion Matrix
+confMatrix_bs_rfo_1m <- (table(pred[[1]],dat_bs_rfo_test$bs_1m))
+confMatrix_bs_rfo_3m <- (table(pred[[2]],dat_bs_rfo_test$bs_3m))
+confMatrix_bs_rfo_6m <- (table(pred[[3]],dat_bs_rfo_test$bs_6m))
+confMatrix_bs_rfo_1y <- (table(pred[[4]],dat_bs_rfo_test$bs_1y))
+
+write.csv(confMatrix_bs_rfo_1m, file="confMatrix_bs_rfo_1m.csv")
+write.csv(confMatrix_bs_rfo_3m, file="confMatrix_bs_rfo_3m.csv")
+write.csv(confMatrix_bs_rfo_6m, file="confMatrix_bs_rfo_6m.csv")
+write.csv(confMatrix_bs_rfo_1y, file="confMatrix_bs_rfo_1y.csv")
+
+####### Data for ROC ###########
+pr_rfo_1m = predict(mod_bs_rfo_list[[1]],type="prob",newdata=dat_bs_rfo_test)[,2]
+pred_rfo_1m = prediction(pr_rfo_1m, dat_bs_rfo_test$bs_1m)
+perf_rfo_1m = performance(pred_rfo_1m,"tpr","fpr")
+
+pr_rfo_3m = predict(mod_bs_rfo_list[[2]],type="prob",newdata=dat_bs_rfo_test)[,2]
+pred_rfo_3m = prediction(pr_rfo_3m, dat_bs_rfo_test$bs_3m)
+perf_rfo_3m = performance(pred_rfo_3m,"tpr","fpr")
+
+pr_rfo_6m = predict(mod_bs_rfo_list[[3]],type="prob",newdata=dat_bs_rfo_test)[,2]
+pred_rfo_6m = prediction(pr_rfo_6m, dat_bs_rfo_test$bs_6m)
+perf_rfo_6m = performance(pred_rfo_6m,"tpr","fpr")
+
+pr_rfo_1y = predict(mod_bs_rfo_list[[4]],type="prob",newdata=dat_bs_rfo_test)[,2]
+pred_rfo_1y = prediction(pr_rfo_1y, dat_bs_rfo_test$bs_1y)
+perf_rfo_1y = performance(pred_rfo_1y,"tpr","fpr")
+
+####### AUC ###########
+auc_bs_rfo_1m <- performance(pred_rfo_1m,"auc") #Calculate the AUC value
+auc_bs_rfo_1m <- auc_bs_rfo_1m@y.values[[1]]
+
+auc_bs_rfo_3m <- performance(pred_rfo_3m,"auc") #Calculate the AUC value
+auc_bs_rfo_3m <- auc_bs_rfo_3m@y.values[[1]]
+
+auc_bs_rfo_6m <- performance(pred_rfo_6m,"auc") #Calculate the AUC value
+auc_bs_rfo_6m <- auc_bs_rfo_6m@y.values[[1]]
+
+auc_bs_rfo_1y <- performance(pred_rfo_1y,"auc") #Calculate the AUC value
+auc_bs_rfo_1y <- auc_bs_rfo_1y@y.values[[1]]
+
+### Outputs
+# 1m 
+png('plot_roc_bs_rfo_1m.png')
+plot(perf_rfo_1m, main = paste0("BS 1m: ROC Curve for Random Forest -  ","AUC = ", round(auc_bs_rfo_1m*100,1),"%"), col="steelblue", lwd=2)
+abline(a=0, b=1, col="gray")
+
+# 3m 
+png('plot_roc_bs_rfo_3m.png')
+plot(perf_rfo_3m, main = paste0("BS 3m: ROC Curve for Random Forest -  ","AUC = ", round(auc_bs_rfo_3m*100,1),"%"), col="steelblue", lwd=2)
+abline(a=0, b=1, col="gray")
+
+# 6m
+png('plot_roc_bs_rfo_6m.png')
+plot(perf_rfo_6m, main = paste0("BS 6m: ROC Curve for Random Forest -  ","AUC = ", round(auc_bs_rfo_6m*100,1),"%"), col="steelblue", lwd=2)
+abline(a=0, b=1, col="gray")
+
+# 1y
+png('plot_roc_bs_rfo_1y.png')
+plot(perf_rfo_1y, main = paste0("BS 1y: ROC Curve for Random Forest -  ","AUC = ", round(auc_bs_rfo_1y*100,1),"%"), col="steelblue", lwd=2)
+abline(a=0, b=1, col="gray")
+
+
+```
+
+```{r}
+
+bswan <- as.data.frame(cbind("pBS"=pred[[4]], "tBS"=dat_bs_rfo_test$bs_1y, "name"=dat_bs_rfo_test$name, "date"=as.Date(dat_bs_rfo_test$value_date)))
+bswan$tp <- bswan$pBS*bswan$tBS
+bswan$fp <- bswan$pBS-bswan$tBS
+bswan$fn <- bswan$tBS-bswan$pBS
+
+bswan_tp <- subset(bswan, bswan$tp==2)
+bswan_fp <- subset(bswan, bswan$fp==2)
+bswan_fn <- subset(bswan, bswan$fn==0)
+
+write.csv(bswan_tp, file = "bswan_tp.csv")
+write.csv(bswan_fp, file = "bswan_fp.csv")
+write.csv(bswan_fn, file = "bswan_fn.csv")
+
+table(bswan$pBS, bswan$tBS)
+
+partialPlot(mod_bs_rfo_list[[4]], dat_bs_rfo_test[complete.cases(dat_bs_rfo_test),], dat_bs_rfo_test$Utilities)
+
+```
+
+3.4 Performance Estimation - Importance
+```{r}
+# Output
+n_equations <- c("f_bs_1m", "f_bs_3m", "f_bs_6m",  "f_bs_1y")  
+## Importance
+imp_mod_bs_rfo <- setNames(lapply(mod_bs_rfo_list, function(x) importance(x)), n_equations)
+write.list(imp_mod_bs_rfo, file = "imp_mod_bs_rfo.csv", row.names = TRUE) # tables output with score importance
+
+#################### Plots for importance ####################
+#### %IncMSE
+# 1m
+plot_imp_mse_bs_1m <- as.data.frame(imp_mod_bs_rfo$f_bs_1m[1:52,1]) 
+plot_imp_mse_bs_1m <- tibble::rownames_to_column(plot_imp_mse_bs_1m, "Scores")
+plot_imp_mse_bs_1m <- plot_imp_mse_bs_1m %>% mutate(ranking = rank(desc(plot_imp_mse_bs_1m[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_mse_bs_1m) <- c("Scores" ,'IncMSE' )
+
+ggplot(plot_imp_mse_bs_1m, aes(x=reorder(Scores,IncMSE), y = IncMSE)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for Black Swan-1m")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_bs_rfo_imp_mse_1m.png", width = 4, height = 6)
+
+# 3m
+plot_imp_mse_bs_3m <- as.data.frame(imp_mod_bs_rfo$f_bs_3m[1:52,1]) 
+plot_imp_mse_bs_3m <- tibble::rownames_to_column(plot_imp_mse_bs_3m, "Scores")
+plot_imp_mse_bs_3m <- plot_imp_mse_bs_3m %>% mutate(ranking = rank(desc(plot_imp_mse_bs_3m[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_mse_bs_3m) <- c("Scores" ,'IncMSE' )
+
+ggplot(plot_imp_mse_bs_3m, aes(x=reorder(Scores,IncMSE), y = IncMSE)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for Black Swan-3m")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_bs_rfo_imp_mse_3m.png", width = 4, height = 6)
+
+# 6m
+plot_imp_mse_bs_6m <- as.data.frame(imp_mod_bs_rfo$f_bs_6m[1:52,1]) 
+plot_imp_mse_bs_6m <- tibble::rownames_to_column(plot_imp_mse_bs_6m, "Scores")
+plot_imp_mse_bs_6m <- plot_imp_mse_bs_6m %>% mutate(ranking = rank(desc(plot_imp_mse_bs_6m[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_mse_bs_6m) <- c("Scores" ,'IncMSE' )
+
+ggplot(plot_imp_mse_bs_6m, aes(x=reorder(Scores,IncMSE), y = IncMSE)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for Black Swan-6m")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_bs_rfo_imp_mse_6m.png", width = 4, height = 6)
+
+# 1y
+plot_imp_mse_bs_1y <- as.data.frame(imp_mod_bs_rfo$f_bs_1y[1:52,1]) 
+plot_imp_mse_bs_1y <- tibble::rownames_to_column(plot_imp_mse_bs_1y, "Scores")
+plot_imp_mse_bs_1y <- plot_imp_mse_bs_1y %>% mutate(ranking = rank(desc(plot_imp_mse_bs_1y[,2])))%>% filter(ranking < 20)
+colnames(plot_imp_mse_bs_1y) <- c("Scores" ,'IncMSE' )
+
+ggplot(plot_imp_mse_bs_1y, aes(x=reorder(Scores,IncMSE), y = IncMSE)) +
+  geom_bar(stat='identity', color="white", fill=cbPalette[[5]]) +
+  coord_flip() + 
+  ggtitle(paste0("Importance for Black Swan-1y")) +
+  xlab("ESG Scores") +
+  myattributes + 
+  ggsave("plot_bs_rfo_imp_mse_1y.png", width = 4, height = 6)
+
+summary(db$mdd_3y)
+```
+
+3.5 Prediction using Random Forest for Aug 2018
+```{r}
+# prepare data to predict
+dat_mdd <- db %>% select(G.1.1, G.1.2, G.1.3, G.1.4, G.1.5, G.2.1, G.2.2, G.2.3, G.2.4, G.2.5, G.2.6, G.2.7, G.2.8, G.2.9, G.2.10, G.2.11, G.2.12, G.2.13, G.3.1, G.3.2, G.3.4, S.1.1, S.1.2, S.1.3, S.1.4, S.1.5, S.1.6, S.1.7, S.2.1, S.2.2, S.2.3, S.3.3, S.4.1, S.4.3, S.5.1, S.5.2, S.5.3, E.1.1, E.1.2, E.1.3, E.1.4, E.1.5, E.1.6, E.1.7, E.1.8, E.1.9, E.1.10, E.1.11, E.1.12, E.2.1, E.2.2, E.3.2, Communication, ConsumerDiscret, ConsumerStaples, Energy, Financials, HealthCare, Industrial,IT, Materials, RealEstate, Utilities, Europe, NorthAmerica, AsiaPacific, AfricaMiddleEast, LatinAmericaCaribbean, size_Large, size_Mid, size_Small, DevelopedMarkets, EmergingMarkets, company_id, name, date)
+
+# PROBLEM: there are 13 scores without any value from 2018-01-01 and on. Therefore, we cannot predict
+dat_mdd %>% subset(date>"2017-12-31") %>% 
+  select(everything()) %>% summarise_all(funs(sum(is.na(.))))
+
+dat_mdd %>% subset(date>"2018-07-31") %>%  # same thing for Aug 2018 (13 scores with NA)
+  select(everything()) %>% summarise_all(funs(sum(is.na(.))))
+
+
+########### let's use the latest non-NA value for each company to fill the NA
+dat_fill <- dat_mdd %>% group_by(name) %>% fill(G.1.1:E.3.2) #
+sum(complete.cases(dat_mdd)) # 132,915 complete cases
+sum(complete.cases(dat_fill)) # 196,929 complete cases - 64,014 new cases without NA
+
+# now there are 1,899 companies with data in Aug 2018
+mean_allPeriod <- dat_fill %>% 
+  group_by(name) %>% 
+  summarise_at(vars(G.1.1:size_Small), mean, na.rm=TRUE)
+sum(complete.cases(mean_allPeriod))
+#openxlsx::write.xlsx(mean_allPeriod, file = "mean_allPeriod.xlsx")
+
+Aug2018 <- dat_fill %>% 
+  select(everything()) %>% 
+  subset(date>"2018-07-31") %>% 
+  group_by(name) %>% 
+  summarise_at(vars(G.1.1:size_Small), mean, na.rm=TRUE)
+sum(complete.cases(Aug2018))
+#openxlsx::write.xlsx(Aug2018, file = "Aug2018.xlsx")
+
+Aug2018_complete <- Aug2018[complete.cases(Aug2018),]
+
+
+
+########### call the model list
+mod_bs_rfo_list <- readRDS("mod_bs_rfo_list.RDA")
+
+# predict
+p_bs1y <- predict(mod_bs_rfo_list[[4]], newdata = Aug2018_complete, type = "prob")
+p_bs1y <- data.frame(cbind(Aug2018_complete, p_bs1y))
+openxlsx::write.xlsx(p_bs1y, file = "p_bs1y.xlsx")
+
+
+
+```
+
+
+
+
