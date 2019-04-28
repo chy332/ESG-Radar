@@ -1,0 +1,353 @@
+---
+title: "Causality - MDD"
+author: "Black Swan - Capstone Group"
+date: "April 13, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir = getwd())
+
+#install.packages("fastDummies")
+#install.packages("erer") # save list as .csv
+#install.packages("AER")
+library(fastDummies)
+library(data.table)
+library(erer)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(tidyverse)
+library(lubridate)
+library(plm) # panel model
+library(AER) # IV regression
+library(stargazer) # tables for output regression
+library(lmtest) # robust standard error
+
+# Pallete 
+cbPalette <- c("#164D73", "#F7BD36", "#E04E70", "#164D73", "#8B8F9A")
+# Basic charts specs 
+myattributes <- theme_bw() +
+                theme(panel.border = element_blank(), 
+                      panel.grid.major = element_blank(), 
+                      panel.grid.minor = element_blank(), 
+                      axis.line = element_line(color = "grey"), 
+                      axis.ticks.x = element_blank(), 
+                      axis.ticks.y = element_blank(),
+                      plot.caption=element_text(size=9,
+                                                color = "grey"))
+
+
+```
+
+0. Database
+```{r database}
+# Importing database
+db <- read.csv("esg_scores_8Feb.csv")
+
+# Selecting variables for causality model
+vars <- c("ï..company_id", "name", "region", "gics_sector", "gics_industry", "size", "value_date", "ESG", "E", "S", "G", "mdd_1m","mdd_3m", "mdd_6m",  "mdd_1y", "mdd_18m", "mdd_3y")
+
+dat <- db  %>% select(vars)
+
+```
+
+1. Preparing data
+```{r}
+
+dat <- dummy_cols(dat, select_columns = "gics_sector")
+setnames(dat, old=c("gics_sector_Communication Services", "gics_sector_Consumer Discretionary", 
+                   "gics_sector_Consumer Staples", "gics_sector_Energy", "gics_sector_Financials", 
+                   "gics_sector_Health Care", "gics_sector_Industrials", 
+                   "gics_sector_Information Technology", "gics_sector_Materials", 
+                   "gics_sector_Real Estate", "gics_sector_Utilities"), 
+         new=c("Communication", "ConsumerDiscret", "ConsumerStaples", "Energy", "Financials", 
+               "HealthCare", "Industrial", "IT", "Materials", "RealEstate", "Utilities"))
+
+dat <- dummy_cols(dat, select_columns = "region")
+setnames(dat, old=c("region_Europe", "region_North America", "region_Asia Pacific", 
+                   "region_Middle East and Africa", "region_Latin America and Caribbean"), 
+       new=c("Europe", "NorthAmerica", "AsiaPacific", "AfricaMiddleEast", "LatinAmericaCaribbean"))
+
+dat <- dummy_cols(dat, select_columns = "size")
+setnames(dat, old=c("size_Large", "size_Mid", "size_Small"), 
+         new=c("Large", "Mid", "Small"))
+
+dat$date <- as.Date(dat$value_date, format="%m/%d/%Y")
+
+# organizing dataframe
+setnames(dat, old=c("ï..company_id"), new=c("id"))
+dat <- dat %>% select(-region, -gics_sector, -size, -value_date)
+dat <- dat %>% select("id", "name", "date", everything())
+
+```
+
+
+2. Analyzing data
+We are going to use a list of corporate scandals. So far, the list of scandals comes from an IG news, "Top 10 biggest corporate scandals and how they affected share prices".
+```{r}
+# Mean of ESG and MDD before and after the shock
+
+shockAnalysis <- function(company, target, shockPropagation){
+  
+  industry <- unique(dat$gics_industry[dat$name==company])
+  tgtCorrect <- ifelse(str_sub(target,-2,-1)=="1m",1, ifelse(
+    str_sub(target,-2,-1)=="3m",3, ifelse(
+      str_sub(target,-2,-1)=="6m",6, ifelse(
+        str_sub(target,-2,-1)=="1y",12, ifelse(
+          str_sub(target,-3,-1)=="18m",18, ifelse(
+            str_sub(target,-2,-1)=="3y",36,"Error"
+  ))))))
+  shockDate <- unique(shocks$shockDate[shocks$company==company])
+  
+  # Company affected by shock
+  pre <- dat %>% subset(name==company & 
+                          date>as.Date(shockDate) %m-% months(tgtCorrect) %m-% months(shockPropagation) &
+                          date<as.Date(shockDate) %m-% months(tgtCorrect)) %>% 
+    summarise(ESG=mean(ESG, na.rm = TRUE), 
+              MDD=mean(eval(parse(text=target)), na.rm = TRUE))
+  pre <- cbind(company, industry, pre, target, shockPropagation, shockDate)
+  
+  post <- dat %>% subset(name==company & 
+                           date>as.Date(shockDate) & 
+                           date<as.Date(shockDate) %m+% months(shockPropagation)) %>% 
+    summarise(ESG=mean(ESG, na.rm = TRUE), 
+              MDD=mean(eval(parse(text=target)), na.rm = TRUE))
+  post <- cbind(company, industry, post, target, shockPropagation, shockDate)
+  
+  tblShockComp <- rbind(PreShock_Company=pre, PostShock_Company=post)
+  
+  # Remaining industry ESG and performance
+  pre <- dat %>% subset(gics_industry==industry & 
+                          date>=as.Date(shockDate) %m-% months(tgtCorrect) %m-% months(shockPropagation) &
+                          date<as.Date(shockDate) %m-% months(tgtCorrect)  & 
+                          name != company) %>% 
+    summarise(ESG=mean(ESG, na.rm = TRUE), 
+              MDD=mean(eval(parse(text=target)), na.rm = TRUE))
+  pre <- cbind(company, industry, pre, target, shockPropagation, shockDate)
+  
+  
+  post <- dat %>% subset(gics_industry==industry & 
+                           date>=as.Date(shockDate) & 
+                           date<=as.Date(shockDate) %m+% months(shockPropagation) & 
+                           name != company) %>% 
+    summarise(ESG=mean(ESG, na.rm = TRUE), 
+              MDD=mean(eval(parse(text=target)), na.rm = TRUE))
+  post <- cbind(company, industry, post, target, shockPropagation, shockDate)
+  
+  tblShockInd <- rbind(PreShock_RemainingIndustry=pre, PostShock_RemainingIndustry=post)
+  
+  tblShock <- rbind(tblShockComp, tblShockInd)
+  return(tblShock)
+  
+}
+
+# run function
+shocks <- read.csv("shocks.csv")
+shocks$shockDate <- as.Date(shocks$shockDate, format="%m/%d/%Y")
+
+shockAnalysisList <- lapply(
+  as.vector(shocks$companyName), function(x){
+    lapply(
+      c(3,6), function(y){
+        shockAnalysis(company = x, target = "mdd_6m", shockPropagation = y)
+        })
+    })
+
+write.list(shockAnalysisList, "shockAnalysisList1.csv", row.names = TRUE)
+
+```
+
+FUNCTION: Build database function for IV Model
+```{r}
+############ START: Function to build data for IV model ############
+shockData <- function(company, target, shockPropagation){
+  # inputs of shocks: company, data, target variable and shock propagation (months persistence)
+  industry <- unique(dat$gics_industry[dat$name==company])
+  shockDate <- unique(shocks$shockDate[shocks$company==company])
+  tgtCorrect <- ifelse(str_sub(target,-2,-1)=="1m",1, ifelse(
+      str_sub(target,-2,-1)=="3m",3, ifelse(
+        str_sub(target,-2,-1)=="6m",6, ifelse(
+          str_sub(target,-2,-1)=="1y",12, ifelse(
+            str_sub(target,-3,-1)=="18m",18, ifelse(
+              str_sub(target,-2,-1)=="3y",36,"Error"
+    ))))))
+  
+  
+  # computation of ESG and mdd mean before the shock
+  pre <- dat %>% subset(date>=(as.Date(shockDate) %m-% months(tgtCorrect) %m-%
+                                 months(shockPropagation)) &
+                          date<(as.Date(shockDate) %m-% months(tgtCorrect))) %>%
+    group_by(id) %>% 
+    summarise(ESG=mean(ESG, na.rm = TRUE), 
+              mdd=mean(eval(parse(text=target)), na.rm = TRUE))
+  # combining with variables necessary to the IV regression and adding date of pre-shock period and dummy of the shock (in this case = 0, since it is before shock)
+  pre <- pre %>% 
+    inner_join(vars_dat, by = "id")
+  pre <- pre %>% 
+    cbind(date=as.Date(shockDate) %m-% months(1), 
+          d_Industry=ifelse(pre$gics_industry==industry,1,0),
+          d_Shock=0,
+          d_IndustryShock=0,
+          d_CompanyShock=ifelse(pre$name==company,1,0),
+          shockName=company)
+  
+  # computation of ESG and mdd mean after the shock
+  post <- dat %>% subset(date>=as.Date(shockDate) &
+                          date<as.Date(shockDate) %m+% months(shockPropagation)) %>%
+    group_by(id) %>% 
+    summarise(ESG=mean(ESG, na.rm = TRUE), 
+              mdd=mean(eval(parse(text=target)), na.rm = TRUE))
+  # combining with variables necessary to the IV regression and adding date of shock period and dummy of the shock (in this case = 1, if it is any company of the sector of the company that suffered the shock. The company that suffered the shock is 0)
+  post <- post %>% 
+    inner_join(vars_dat, by = "id")
+  post <- post %>% 
+    cbind(date=as.Date(shockDate), 
+          d_Industry=ifelse(post$gics_industry==industry,1,0),
+          d_Shock = 1,
+          d_IndustryShock=ifelse(post$gics_industry==industry,1,0), # & post$name!=company,
+          d_CompanyShock=ifelse(post$name==company,1,0),
+          shockName=company) 
+ 
+  prePost <- rbind(pre, post)
+  return(prePost)
+}
+############ END: Function to build data for IV model ############
+
+# variables necessary to IV regression
+vars_dat <-
+  dat %>%
+  select(-c(date, ESG, E, S, G, mdd_1m, mdd_3m, mdd_6m, mdd_1y, mdd_18m, mdd_3y)) %>%
+  unique()
+
+```
+
+
+3. Run the fucntion to create database for IV Model. Choose the shocks, target variable and shock persistence
+```{r}
+############ Run function to create data frame
+# list of shocks
+shocks <- read.csv("shocks.csv")
+shocks$shockDate <- as.Date(shocks$shockDate, format="%m/%d/%Y")
+shockList <- as.vector(shocks$companyName)
+#shockList <- "Volkswagen AG"
+
+datMod <- data.frame()
+for (i in shockList) {
+  res <- shockData(company = i, target = "mdd_3m", shockPropagation = 3)
+  datMod <- rbind(datMod, res)
+}
+
+# there are some mdd=0. Remove to allow us to take the log
+datMod <- datMod %>% subset(mdd>0) 
+
+# some data analysis
+shockSummary <- datMod %>% 
+ group_by(shockName, d_CompanyShock, d_IndustryShock) %>%  
+ summarise(mean(ESG, na.rm = TRUE), mean(mdd, na.rm = TRUE))
+
+writexl::write_xlsx(shockSummary, "shockSummary_06m03p.xlsx")
+
+```
+
+FUNCTION: Build Function for robust SE and diagnostic output
+```{r}
+# Robust SE function for stargazer
+gaze.coeft <- function(x, col="Std. Error"){
+    stopifnot(is.list(x))
+    out <- lapply(x, function(y){
+        y[ , col]
+    })
+    return(out)
+}
+
+# Diagnostic function for stargazer
+gaze.lines.ivreg.diagn <- function(x, col="p-value", row=1:3, digits=2){
+    stopifnot(is.list(x))
+    out <- lapply(x, function(y){
+        stopifnot(class(y)=="summary.ivreg")
+        y$diagnostics[row, col, drop=FALSE]
+    })
+    out <- as.list(data.frame(t(as.data.frame(out)), check.names = FALSE))
+    for(i in 1:length(out)){
+        out[[i]] <- c(names(out)[i], round(out[[i]], digits=digits))
+    }
+    return(out)
+}
+
+
+```
+
+
+4. IV regression
+```{r}
+# Model for each shock
+modListIV <- lapply(shockList, function(x){
+  ivreg((mdd) ~ (ESG) + Europe + NorthAmerica + 
+          AsiaPacific + AfricaMiddleEast + LatinAmericaCaribbean + 
+          Mid + Large + Small | 
+          d_IndustryShock + Europe + NorthAmerica + 
+          AsiaPacific + AfricaMiddleEast + LatinAmericaCaribbean + Mid + Large + Small, 
+        data = subset(datMod, shockName==x & d_Industry==1))
+})
+modListIV <- setNames(modListIV, shockList)
+
+# Summary with the diagnostic and exchange the normal standard errors with robust standard errors
+robustSEList <- lapply(modListIV, function(i) { 
+  coeftest(i, function(x) vcovHC(x, type="HC0"))
+  })
+
+diagnosticList <- lapply(modListIV, function(i){
+  summary(i, vcov. = function(x) vcovHC(x, type="HC0"), diagnostics=T)
+  })
+
+
+# Output using Stargazer
+Out_ModList_IV <- stargazer(modListIV, type = "text", title="IV Regression", align = TRUE,
+                            dep.var.labels=c("Maximum-Drawdown 1-month (MDD)"),
+                            se = gaze.coeft(robustSEList), 
+                            add.lines = gaze.lines.ivreg.diagn(diagnosticList, row=1:2),
+                            out = "Out_ModList_IV_03m03p.html")
+
+summary(modListIV[[3]])
+modListIV
+
+```
+
+
+5. Linear model and first stage
+```{r}
+### Linear Regression: ESG to explain MDD - Linear regression on MDD
+modListLM <- lapply(shockList, function(x){
+  lm((mdd) ~ (ESG) + Europe + NorthAmerica + 
+          AsiaPacific + AfricaMiddleEast + LatinAmericaCaribbean + 
+          Mid + Large + Small, 
+        data = subset(datMod, shockName==x & d_Industry==1))
+})
+modListLM <- setNames(modListLM, shockList)
+
+# Output using Stargazer
+Out_ModList_LM <- stargazer(modListLM, type = "text", title = "Linear Regression", align = TRUE,
+                            dep.var.labels=c("Maximum-Drawdown 1-year (MDD)"),
+                            out = "Out_ModList_LM_01y01p.html")
+
+
+### First stage: shock to explain ESG, but not stocks - Linear regression on ESG
+modListFirst <- lapply(shockList, function(x){
+  lm((ESG) ~ d_IndustryShock + Europe + NorthAmerica + 
+          AsiaPacific + AfricaMiddleEast + LatinAmericaCaribbean + 
+          Mid + Large + Small, 
+        data = subset(datMod, shockName==x & d_Industry==1))
+})
+modListFirst <- setNames(modListFirst, shockList)
+
+# Output using Stargazer
+Out_ModList_First <- stargazer(modListFirst, type = "text", title = "IV First Stage Regression", align = TRUE,
+                            dep.var.labels=c("ESG Score"),
+                            out = "Out_ModList_First_01y01p.html")
+
+
+```
+
